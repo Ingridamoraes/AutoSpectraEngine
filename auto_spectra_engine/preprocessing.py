@@ -1,8 +1,14 @@
 import numpy as np
 import pandas as pd
 
+from scipy.signal import correlate
+from scipy.ndimage import shift
 from scipy.signal import savgol_filter 
 from sklearn.ensemble import IsolationForest
+
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+
 
 def msc(input_data):
     """
@@ -150,34 +156,77 @@ def iso_forest_outlier_removal(X, Ys, contamination):
 
     return clean_data, clean_targets
 
+def icoshift(X, reference=None, intervals=None, max_shift=20):
+    """
+    Apply icoshift alignment to a set of spectra.
 
-def iso_forest_outlier_removal(X, Ys, contamination):
-     # Convert data to DataFrame if it is not already
-    if not isinstance(X, pd.DataFrame):
-        X = pd.DataFrame(X)
+    Parameters:
+    - X: np.ndarray (n_samples, n_points)
+    - reference: np.ndarray (n_points,), reference spectrum. If None, uses mean spectrum.
+    - intervals: list of tuples [(start1, end1), (start2, end2), ...]
+    - max_shift: int, maximum shift (in points) to search on either side
 
-    if contamination<=0:
-      return X, Ys
+    Returns:
+    - aligned_spectra: np.ndarray of aligned spectra
+    """
+    X = np.array(X)
+    n_samples, n_points = X.shape
 
-    # Select only numerical columns
-    numerical_columns = X.select_dtypes(include='number').columns
-    numerical_data = X[numerical_columns]
+    if reference is None:
+        reference = np.mean(X, axis=0)
 
-    # Check if there are numerical columns
-    if numerical_data.empty:
-        raise ValueError("No numerical columns found in the input data.")
+    if intervals is None:
+        # Default: one single interval covering the whole spectrum
+        intervals = [(0, n_points)]
 
-    # Initialize the Isolation Forest model
-    iso_forest = IsolationForest(contamination=contamination, random_state=42)
+    aligned = np.zeros_like(X)
 
-    # Fit the model and predict outliers
-    outliers = iso_forest.fit_predict(numerical_data)
+    for (start, end) in intervals:
+        ref_segment = reference[start:end]
+        for i in range(n_samples):
+            segment = X[i, start:end]
+            corr = correlate(ref_segment, segment, mode='full')
+            lag = np.argmax(corr) - (len(segment) - 1)
 
-    # Filter out the outliers
-    clean_data = X[outliers != -1]
-    clean_targets = Ys[outliers != -1]
+            # Limit shift to max_shift
+            if abs(lag) > max_shift:
+                lag = np.sign(lag) * max_shift
 
-    #print('cont x',clean_data.shape) #apenas para checar
-    #print('cont y', clean_targets.shape) #apenas para checar
+            # Apply the shift (only to the interval)
+            aligned[i, start:end] = shift(segment, shift=lag, mode='nearest')
 
-    return clean_data, clean_targets
+    return aligned
+
+
+def baseline_als(X, lam=1e5, p=0.01, niter=10):
+    """
+    Asymmetric Least Squares baseline correction.
+    Parameters:
+    - X: input spectrum (1D array)
+    - lam: smoothness parameter
+    - p: asymmetry parameter
+    - niter: number of iterations
+    Returns:
+    - baseline: estimated baseline
+    """
+    L = len(X)
+    D = sparse.diags([1,-2,1],[0,-1,-2], shape=(L,L-2))
+    D = lam * D.dot(D.transpose())
+    w = np.ones(L)
+    for _ in range(niter):
+        W = sparse.spdiags(w, 0, L, L)
+        Z = W + D
+        z = spsolve(Z, w*X)
+        w = p * (X > z) + (1-p) * (X < z)
+    return z
+
+def apply_phase_correction(X, phase0=0, phase1=0):
+    """
+    Aplica correção de fase em um espectro complexo.
+    phase0 e phase1 em graus.
+    """
+    n = len(X)
+    freq = np.arange(n)
+    phase_radians = np.deg2rad(phase0 + phase1 * (freq - n/2) / n)
+    correction = np.exp(-1j * phase_radians)
+    return np.real(X * correction)
